@@ -1,4 +1,4 @@
-// 최종본 PvP 서버 - 팀/공수 배정, 코어 설치·해체, 라운드 진행, 체력/스킬 판정
+// 최종본 PvP 서버 - 로비(친구/파티) + 팀/공수 배정 + 코어 설치·해체 + 라운드 진행
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -9,22 +9,29 @@ const io = new Server(server, { cors: { origin: '*' } });
 
 const PORT = process.env.PORT || 3000;
 
-const ROUND_TIME = 90;      // 코어 설치 전 라운드 제한시간(초)
-const CORE_TIMER = 40;      // 코어 설치 후 폭발까지(초)
+const ROUND_TIME = 90;
+const CORE_TIMER = 40;
 const WINS_NEEDED = 5;
 const ROUND_END_DELAY = 4000;
 const MATCH_END_DELAY = 6000;
 const MAX_HEALTH = 100;
+const PARTY_MAX = 5;
 
-// 클라이언트 맵 레이아웃과 반드시 일치해야 하는 사이트 범위
 const SITE_A = { xMin: -18, xMax: -10, zMin: -4, zMax: 4 };
 const SITE_B = { xMin: 10, xMax: 18, zMin: -4, zMax: 4 };
 const DEFUSE_RANGE = 2.4;
 
-const players = {}; // id -> {id,name,team,x,y,z,yaw,health,alive,pending,kills,shieldUntil,shieldReduce}
+// ---------- 로비 상태 (친구/파티는 서버 메모리에만 저장 - 재배포 시 초기화됨) ----------
+const lobbyPlayers = {};        // socketId -> { id, name, partyId }
+const onlineByName = {};        // name -> socketId
+const friends = {};             // name -> Set(name)
+const pendingFriendRequests = {}; // toName -> Set(fromName), 상대가 오프라인일 때 대기
+const parties = {};             // partyId -> { leader: socketId, members: [socketId,...] }
 
+// ---------- 매치 상태 ----------
+const players = {}; // socketId -> {id,name,team,x,y,z,yaw,health,alive,pending,kills,shieldUntil,shieldReduce}
 const match = {
-  state: 'waiting', // waiting | live | roundEnd | matchEnd
+  state: 'waiting',
   roundTimeLeft: ROUND_TIME,
   scoreA: 0,
   scoreB: 0,
@@ -50,6 +57,14 @@ function assignTeam() {
   const { a, b } = teamCounts();
   return a <= b ? 'A' : 'B';
 }
+function assignTeamConsideringParty(me) {
+  if (me.partyId && parties[me.partyId]) {
+    for (const id of parties[me.partyId].members) {
+      if (players[id]) return players[id].team; // 이미 매치 중인 같은 파티원과 같은 팀
+    }
+  }
+  return assignTeam();
+}
 function spawnPointFor(team) {
   const base = team === 'A' ? { x: -28, z: 0 } : { x: 28, z: 0 };
   return {
@@ -62,6 +77,7 @@ function spawnPointFor(team) {
 
 function broadcastPlayers() { io.emit('playersUpdate', players); }
 function broadcastMatchState() { io.emit('matchState', match); }
+function broadcastPresence() { io.emit('presenceUpdate', { online: Object.keys(onlineByName) }); }
 
 function resetAllForRound() {
   Object.values(players).forEach(p => {
@@ -72,8 +88,7 @@ function resetAllForRound() {
     p.shieldReduce = 0;
     const sp = spawnPointFor(p.team);
     p.x = sp.x; p.y = sp.y; p.z = sp.z; p.yaw = sp.yaw;
-    const sock = io.sockets.sockets.get(p.id);
-    if (sock) sock.emit('yourSpawn', sp);
+    io.to(p.id).emit('yourSpawn', sp);
   });
 }
 
@@ -125,7 +140,6 @@ function endRound(winnerTeam) {
   finishRoundAndContinue();
 }
 
-// 설치 전에만 "공격팀 전멸 -> 수비팀 승리"가 즉시 성립. 설치 후엔 해체/폭발로만 라운드가 끝남
 function checkRoundWinByElimination() {
   if (match.state !== 'live' || match.core.planted) return;
   const alive = aliveCounts();
@@ -136,55 +150,160 @@ function checkRoundWinByElimination() {
   if (attackersAlive === 0 && defendersAlive > 0) endRound(defenders);
 }
 
+function broadcastPartyUpdate(partyId) {
+  const party = parties[partyId];
+  if (!party) return;
+  const memberInfo = party.members.map(id => ({
+    id, name: lobbyPlayers[id] ? lobbyPlayers[id].name : '???', isLeader: id === party.leader
+  }));
+  io.to(partyId).emit('partyUpdate', { partyId, members: memberInfo });
+}
+
 io.on('connection', (socket) => {
-  const team = assignTeam();
-  const spawn = spawnPointFor(team);
+  lobbyPlayers[socket.id] = { id: socket.id, name: `Guest${socket.id.slice(0, 4)}`, partyId: null };
+  console.log('로비 접속:', socket.id);
 
-  players[socket.id] = {
-    id: socket.id,
-    name: `Player-${socket.id.slice(0, 4)}`,
-    team,
-    x: spawn.x, y: spawn.y, z: spawn.z, yaw: spawn.yaw,
-    health: MAX_HEALTH,
-    alive: match.state !== 'live',
-    pending: match.state === 'live',
-    kills: 0,
-    shieldUntil: 0,
-    shieldReduce: 0
-  };
-
-  console.log(`플레이어 접속: ${socket.id} (팀 ${team})`);
-
-  socket.emit('yourInfo', { id: socket.id, team });
-  socket.emit('yourSpawn', spawn);
   socket.emit('matchState', match);
-  broadcastPlayers();
+  broadcastPresence();
 
-  if (match.state === 'waiting') tryStartIfReady();
+  function leavePartyInternal() {
+    const me = lobbyPlayers[socket.id];
+    if (!me || !me.partyId) return;
+    const partyId = me.partyId;
+    const party = parties[partyId];
+    socket.leave(partyId);
+    me.partyId = null;
+    socket.emit('partyUpdate', { partyId: null, members: [] });
+    if (party) {
+      party.members = party.members.filter(id => id !== socket.id);
+      if (party.members.length === 0) {
+        delete parties[partyId];
+      } else {
+        if (party.leader === socket.id) party.leader = party.members[0];
+        broadcastPartyUpdate(partyId);
+      }
+    }
+  }
 
+  // ---------- 닉네임 설정 ----------
   socket.on('setName', (name) => {
-    const p = players[socket.id];
-    if (p && typeof name === 'string' && name.trim()) {
-      p.name = name.trim().slice(0, 16);
-      broadcastPlayers();
+    const me = lobbyPlayers[socket.id];
+    if (!me) return;
+    const base = (typeof name === 'string' && name.trim()) ? name.trim().slice(0, 16) : me.name;
+    let finalName = base, suffix = 1;
+    while (onlineByName[finalName] && onlineByName[finalName] !== socket.id) {
+      finalName = `${base}${suffix}`; suffix++;
+    }
+    delete onlineByName[me.name];
+    me.name = finalName;
+    onlineByName[finalName] = socket.id;
+    if (players[socket.id]) players[socket.id].name = finalName;
+
+    socket.emit('nameConfirmed', { name: finalName });
+    socket.emit('friendListUpdate', { friends: friends[finalName] ? Array.from(friends[finalName]) : [] });
+
+    if (pendingFriendRequests[finalName]) {
+      pendingFriendRequests[finalName].forEach(fromName => socket.emit('friendRequestReceived', { fromName }));
+    }
+    broadcastPresence();
+  });
+
+  // ---------- 친구 ----------
+  socket.on('sendFriendRequest', (toName) => {
+    const me = lobbyPlayers[socket.id];
+    if (!me || typeof toName !== 'string' || !toName.trim() || toName === me.name) return;
+    const target = toName.trim().slice(0, 16);
+    const targetSocketId = onlineByName[target];
+    if (targetSocketId) {
+      io.to(targetSocketId).emit('friendRequestReceived', { fromName: me.name });
+    } else {
+      if (!pendingFriendRequests[target]) pendingFriendRequests[target] = new Set();
+      pendingFriendRequests[target].add(me.name);
+    }
+    socket.emit('friendRequestSent', { toName: target });
+  });
+
+  socket.on('respondFriendRequest', (data) => {
+    const me = lobbyPlayers[socket.id];
+    if (!me || !data) return;
+    const fromName = data.fromName;
+    if (pendingFriendRequests[me.name]) pendingFriendRequests[me.name].delete(fromName);
+    if (data.accept) {
+      if (!friends[me.name]) friends[me.name] = new Set();
+      if (!friends[fromName]) friends[fromName] = new Set();
+      friends[me.name].add(fromName);
+      friends[fromName].add(me.name);
+      socket.emit('friendListUpdate', { friends: Array.from(friends[me.name]) });
+      const fromSocketId = onlineByName[fromName];
+      if (fromSocketId) io.to(fromSocketId).emit('friendListUpdate', { friends: Array.from(friends[fromName]) });
     }
   });
 
-  socket.on('move', (data) => {
-    const p = players[socket.id];
-    if (!p || !p.alive) return;
-    p.x = data.x; p.y = data.y; p.z = data.z; p.yaw = data.yaw;
-    socket.broadcast.emit('playerMoved', { id: socket.id, x: p.x, y: p.y, z: p.z, yaw: p.yaw });
+  // ---------- 파티 ----------
+  socket.on('invitePartyMember', (toName) => {
+    const me = lobbyPlayers[socket.id];
+    if (!me || typeof toName !== 'string') return;
+    if (!me.partyId) {
+      const partyId = 'party_' + socket.id;
+      parties[partyId] = { leader: socket.id, members: [socket.id] };
+      me.partyId = partyId;
+      socket.join(partyId);
+      broadcastPartyUpdate(partyId);
+    }
+    if (parties[me.partyId].members.length >= PARTY_MAX) { socket.emit('partyFull'); return; }
+    const targetSocketId = onlineByName[toName.trim()];
+    if (targetSocketId) {
+      io.to(targetSocketId).emit('partyInviteReceived', { fromName: me.name, partyId: me.partyId });
+    }
   });
 
-  // 무기 사격 & 스킬 데미지가 공통으로 사용하는 판정 통로
+  socket.on('respondPartyInvite', (data) => {
+    const me = lobbyPlayers[socket.id];
+    if (!me || !data || !data.accept) return;
+    const party = parties[data.partyId];
+    if (!party) return;
+    if (party.members.length >= PARTY_MAX) { socket.emit('partyFull'); return; }
+    leavePartyInternal();
+    party.members.push(socket.id);
+    me.partyId = data.partyId;
+    socket.join(data.partyId);
+    broadcastPartyUpdate(data.partyId);
+  });
+
+  socket.on('leaveParty', leavePartyInternal);
+
+  // ---------- 매치 참가 (여기서 실제로 팀 배정 + 라운드 로직에 편입됨) ----------
+  socket.on('readyToPlay', () => {
+    if (players[socket.id]) return;
+    const me = lobbyPlayers[socket.id];
+    if (!me) return;
+
+    const team = assignTeamConsideringParty(me);
+    const spawn = spawnPointFor(team);
+    players[socket.id] = {
+      id: socket.id, name: me.name, team,
+      x: spawn.x, y: spawn.y, z: spawn.z, yaw: spawn.yaw,
+      health: MAX_HEALTH,
+      alive: match.state !== 'live',
+      pending: match.state === 'live',
+      kills: 0, shieldUntil: 0, shieldReduce: 0
+    };
+
+    socket.emit('yourInfo', { id: socket.id, team });
+    socket.emit('yourSpawn', spawn);
+    socket.emit('matchState', match);
+    broadcastPlayers();
+    if (match.state === 'waiting') tryStartIfReady();
+  });
+
+  // ---------- 무기 사격 & 스킬 데미지 ----------
   socket.on('shootHit', (data) => {
     const shooter = players[socket.id];
     const target = players[data.targetId];
     if (!shooter || !target) return;
     if (match.state !== 'live') return;
     if (!shooter.alive || !target.alive) return;
-    if (shooter.team === target.team) return; // 팀킬 방지 (스킬도 동일 적용)
+    if (shooter.team === target.team) return;
 
     let dmg = Math.max(1, Math.min(200, Number(data.damage) || 0));
     if (target.shieldUntil && target.shieldUntil > Date.now()) {
@@ -206,7 +325,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // 회복 스킬
   socket.on('healSelf', (amount) => {
     const p = players[socket.id];
     if (!p || !p.alive || match.state !== 'live') return;
@@ -215,7 +333,6 @@ io.on('connection', (socket) => {
     socket.emit('healthUpdate', { id: socket.id, health: p.health });
   });
 
-  // 보호막 스킬 (이후 들어오는 데미지 감소)
   socket.on('activateShield', (data) => {
     const p = players[socket.id];
     if (!p || !p.alive || match.state !== 'live') return;
@@ -223,14 +340,12 @@ io.on('connection', (socket) => {
     p.shieldReduce = Math.max(0, Math.min(0.9, Number(data.reduceRatio) || 0));
   });
 
-  // 시각효과/유틸 스킬은 서버가 그대로 다른 클라이언트에 중계만 함
   socket.on('abilityCast', (data) => {
     const p = players[socket.id];
     if (!p || !p.alive || match.state !== 'live') return;
     socket.broadcast.emit('abilityCast', { ...data, casterId: socket.id, casterTeam: p.team, casterName: p.name });
   });
 
-  // 코어 설치 (공격팀만, 사이트 안에서만)
   socket.on('plantCore', () => {
     const p = players[socket.id];
     if (!p || !p.alive || match.state !== 'live' || match.core.planted) return;
@@ -238,13 +353,11 @@ io.on('connection', (socket) => {
     const inA = p.x >= SITE_A.xMin && p.x <= SITE_A.xMax && p.z >= SITE_A.zMin && p.z <= SITE_A.zMax;
     const inB = p.x >= SITE_B.xMin && p.x <= SITE_B.xMax && p.z >= SITE_B.zMin && p.z <= SITE_B.zMax;
     if (!inA && !inB) return;
-
     match.core = { planted: true, x: p.x, y: 1, z: p.z, timeLeft: CORE_TIMER, site: inA ? 'A' : 'B' };
     broadcastMatchState();
     io.emit('corePlanted', { byId: p.id, byName: p.name, site: match.core.site });
   });
 
-  // 코어 해체 (수비팀만, 설치된 코어 근처에서만)
   socket.on('defuseCore', () => {
     const p = players[socket.id];
     if (!p || !p.alive || match.state !== 'live' || !match.core.planted) return;
@@ -252,52 +365,57 @@ io.on('connection', (socket) => {
     if (p.team !== defenders) return;
     const dx = p.x - match.core.x, dz = p.z - match.core.z;
     if (Math.sqrt(dx * dx + dz * dz) > DEFUSE_RANGE) return;
-
     io.emit('coreDefused', { byId: p.id, byName: p.name });
     endRound(defenders);
   });
 
+  socket.on('move', (data) => {
+    const p = players[socket.id];
+    if (!p || !p.alive) return;
+    p.x = data.x; p.y = data.y; p.z = data.z; p.yaw = data.yaw;
+    socket.broadcast.emit('playerMoved', { id: socket.id, x: p.x, y: p.y, z: p.z, yaw: p.yaw });
+  });
+
   socket.on('disconnect', () => {
-    console.log('플레이어 퇴장:', socket.id);
-    delete players[socket.id];
-    io.emit('playerLeft', socket.id);
-    checkRoundWinByElimination();
-    if (Object.keys(players).length < 2 && match.state !== 'roundEnd' && match.state !== 'matchEnd') {
-      match.state = 'waiting';
-      broadcastMatchState();
+    console.log('접속 종료:', socket.id);
+    const me = lobbyPlayers[socket.id];
+    if (me) delete onlineByName[me.name];
+    leavePartyInternal();
+    delete lobbyPlayers[socket.id];
+
+    if (players[socket.id]) {
+      delete players[socket.id];
+      io.emit('playerLeft', socket.id);
+      checkRoundWinByElimination();
+      if (Object.keys(players).length < 2 && match.state !== 'roundEnd' && match.state !== 'matchEnd') {
+        match.state = 'waiting';
+        broadcastMatchState();
+      }
     }
+    broadcastPresence();
   });
 });
 
-// 서버 기준 1초 틱 - 라운드 타이머 또는 코어 타이머 진행
 setInterval(() => {
   if (match.state !== 'live') return;
-
   if (match.core.planted) {
     match.core.timeLeft--;
-    if (match.core.timeLeft <= 0) {
-      match.core.timeLeft = 0;
-      endRound(match.attackingTeam); // 폭발 -> 공격팀 승리
-    } else {
-      broadcastMatchState();
-    }
+    if (match.core.timeLeft <= 0) { match.core.timeLeft = 0; endRound(match.attackingTeam); }
+    else broadcastMatchState();
     return;
   }
-
   match.roundTimeLeft--;
   if (match.roundTimeLeft <= 0) {
     match.roundTimeLeft = 0;
     const defenders = match.attackingTeam === 'A' ? 'B' : 'A';
-    endRound(defenders); // 설치 못하고 시간 종료 -> 수비팀 승리
+    endRound(defenders);
     return;
   }
   broadcastMatchState();
 }, 1000);
 
 app.get('/', (req, res) => {
-  res.send('PvP 서버 작동 중. 접속자: ' + Object.keys(players).length + '명');
+  res.send('PvP 서버 작동 중. 로비: ' + Object.keys(lobbyPlayers).length + '명, 매치: ' + Object.keys(players).length + '명');
 });
 
-server.listen(PORT, () => {
-  console.log(`서버 실행 중, 포트 ${PORT}`);
-});
+server.listen(PORT, () => console.log(`서버 실행 중, 포트 ${PORT}`));
