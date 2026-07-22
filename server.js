@@ -346,6 +346,12 @@ io.on('connection', (socket) => {
     socket.broadcast.emit('abilityCast', { ...data, casterId: socket.id, casterTeam: p.team, casterName: p.name });
   });
 
+  socket.on('weaponFired', (data) => {
+    const p = players[socket.id];
+    if (!p || !p.alive || match.state !== 'live') return;
+    socket.broadcast.emit('weaponFired', { ...data, shooterId: socket.id });
+  });
+
   socket.on('plantCore', () => {
     const p = players[socket.id];
     if (!p || !p.alive || match.state !== 'live' || match.core.planted) return;
